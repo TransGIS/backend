@@ -354,7 +354,7 @@ apiRouter.get('/route-recommendations', async (_request, response) => {
     response.json({ items })
 })
 
-apiRouter.get('/dashboard', async (_request, response) => {
+apiRouter.get('/dashboard', async (request, response) => {
     const [biskita, angkot] = await Promise.all([
         Route.countDocuments({ tipe: 'biskita' }),
         Route.countDocuments({ tipe: 'angkot' }),
@@ -373,33 +373,35 @@ apiRouter.get('/dashboard', async (_request, response) => {
     ])
     const fareOf = new Map(fareAgg.map((f) => [f._id, f.fares.sort().join(', ')]))
 
-    // Kunjungan dihitung per tanggal nyata selama 14 hari terakhir, bukan dari
-    // "14 dokumen terakhir" — supaya baris lama (termasuk sisa seed dummy) yang
-    // tanggalnya sudah lewat tidak lagi tampil sebagai data minggu ini.
+    // Satu periode aktif + satu periode sebelumnya untuk delta. Semua titik
+    // memakai tanggal nyata; hari tanpa data tetap muncul dengan nilai nol.
+    const RANGE_DAYS = { '7d': 7, '1m': 30, '6m': 182, '1y': 365 }
+    const range = Object.hasOwn(RANGE_DAYS, request.query.range) ? request.query.range : '7d'
+    const days = RANGE_DAYS[range]
     const DAY_MS = 24 * 3600 * 1000
     const dayKey = (t) => new Date(t).toISOString().slice(0, 10)
     const now = Date.now()
-    const keys = Array.from({ length: 14 }, (_, i) => dayKey(now - (13 - i) * DAY_MS))
-    const views = await PageView.find({ date: { $gte: keys[0], $lte: keys[13] } }).lean()
+    const keys = Array.from({ length: days * 2 }, (_, i) => dayKey(now - (days * 2 - 1 - i) * DAY_MS))
+    const lastDay = keys[keys.length - 1]
+    const views = await PageView.find({ date: { $gte: keys[0], $lte: lastDay } }).lean()
     const countOf = new Map(views.map((v) => [v.date, v.count]))
-    const lastKeys = keys.slice(7)
-    const prevKeys = keys.slice(0, 7)
+    const lastKeys = keys.slice(days)
+    const prevKeys = keys.slice(0, days)
     const totalOf = (arr) => arr.reduce((sum, key) => sum + (countOf.get(key) || 0), 0)
-    // Pengunjung unik per tanggal (ID anonim dari cookie). Total 7 hari memakai
-    // himpunan gabungan ID, bukan penjumlahan unik harian — orang yang datang di
-    // beberapa hari tidak dihitung berkali-kali.
+    // Grafik memakai unik harian. Total kartu memakai himpunan ID selama periode,
+    // sehingga orang yang datang pada beberapa hari tidak dihitung berulang.
     const visitorAgg = await PageVisitor.aggregate([
-        { $match: { date: { $gte: keys[0], $lte: keys[13] } } },
+        { $match: { date: { $gte: keys[0], $lte: lastDay } } },
         { $group: { _id: '$date', vids: { $addToSet: '$vid' } } },
     ])
-    const uniqOf = new Map(visitorAgg.map((v) => [v._id, v.vids.length]))
-    const uniqSetOf = (arr) => new Set(arr.flatMap((key) => visitorAgg.find((v) => v._id === key)?.vids || []))
+    const uniqIdsOf = new Map(visitorAgg.map((v) => [v._id, v.vids]))
+    const uniqSetOf = (arr) => new Set(arr.flatMap((key) => uniqIdsOf.get(key) || []))
 
-    const series = lastKeys.map((key) => [
-        new Date(`${key}T00:00:00`).toLocaleDateString('id-ID', { weekday: 'short' }),
-        countOf.get(key) || 0,
-        uniqOf.get(key) || 0,
-    ])
+    const series = lastKeys.map((key) => ({
+        date: key,
+        visits: countOf.get(key) || 0,
+        unique: uniqIdsOf.get(key)?.length || 0,
+    }))
     const prevTotal = totalOf(prevKeys)
     const visits = {
         total: totalOf(lastKeys),
@@ -428,7 +430,38 @@ apiRouter.get('/dashboard', async (_request, response) => {
         angkot: { total: angkot, baru: baruOf.get('angkot') || 0, tarif: fareOf.get('angkot') || '—' },
         visits,
         unique,
+        range,
         series,
         history,
     })
+})
+
+/* Notifikasi admin: hanya tiga aksi tulis trayek yang dicatat. */
+const NOTIF = {
+    'create-route': { kind: 'create', label: 'Rute ditambahkan' },
+    'update-route': { kind: 'update', label: 'Rute diperbarui' },
+    'delete-route': { kind: 'delete', label: 'Rute dihapus' },
+}
+
+apiRouter.get('/notifications', async (request, response) => {
+    const limit = Math.min(Math.max(Number(request.query.limit) || 12, 1), 50)
+    const logs = await ActivityLog.find({ action: { $in: Object.keys(NOTIF) } })
+        .sort({ timestamp: -1 })
+        .limit(limit)
+        .populate('adminId', 'nama username')
+        .lean()
+    const items = logs.map((log) => {
+        const snap = log.changes?.after || log.changes?.before || {}
+        const kode = snap.kodeRute || log.targetId || ''
+        return {
+            id: String(log._id),
+            kind: NOTIF[log.action].kind,
+            label: NOTIF[log.action].label,
+            route: snap.namaRute ? `${kode} — ${snap.namaRute}` : String(kode || 'Rute'),
+            note: [snap.asal, snap.tujuan].filter(Boolean).join(' → '),
+            actor: log.adminId?.nama || log.adminId?.username || 'Admin',
+            at: log.timestamp,
+        }
+    })
+    response.json({ items })
 })
