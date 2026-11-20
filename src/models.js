@@ -75,6 +75,15 @@ export const PageView = model('PageView', 'page_views', new mongoose.Schema({
     count: { type: Number, default: 0 },
 }))
 
+/* Pengunjung unik per hari: satu baris = satu ID anonim (cookie) yang terlihat
+   pada tanggal tersebut. Tidak menyimpan IP, user-agent, atau identitas lain. */
+const pageVisitorSchema = new mongoose.Schema({
+    date: { type: String, required: true }, // YYYY-MM-DD
+    vid: { type: String, required: true },  // ID acak (UUID) dari cookie
+})
+pageVisitorSchema.index({ date: 1, vid: 1 }, { unique: true })
+export const PageVisitor = model('PageVisitor', 'page_visitors', pageVisitorSchema)
+
 export async function logActivity(entry) {
     try {
         await ActivityLog.create(entry)

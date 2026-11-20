@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { requireAuth } from './auth.js'
-import { ActivityLog, PageView, Route, RouteRecommendation, RouteStop, Stop, logActivity } from './models.js'
+import { ActivityLog, PageView, PageVisitor, Route, RouteRecommendation, RouteStop, Stop, logActivity } from './models.js'
 
 const TIPE = new Set(['biskita', 'angkot'])
 const TIPE_TARIF = new Set(['flat', 'jarak'])
@@ -153,6 +153,23 @@ apiRouter.post('/public/route-recommendations', async (request, response) => {
 apiRouter.post('/public/page-view', async (_request, response) => {
     const date = new Date().toISOString().slice(0, 10)
     await PageView.findOneAndUpdate({ date }, { $inc: { count: 1 } }, { upsert: true })
+    response.status(201).json({ ok: true })
+})
+
+/* Catat pengunjung unik harian. `vid` hanya ID acak dari cookie yang dibuat
+   setelah pengguna menyetujui; tidak ada data pribadi yang dikirim/disimpan. */
+apiRouter.post('/public/visitor', async (request, response) => {
+    const vid = str(request.body?.vid, 64)
+    if (!/^[A-Za-z0-9-]{8,64}$/.test(vid)) {
+        return response.status(400).json({ ok: false, message: 'ID pengunjung tidak valid.' })
+    }
+    const date = new Date().toISOString().slice(0, 10)
+    try {
+        await PageVisitor.updateOne({ date, vid }, { $setOnInsert: { date, vid } }, { upsert: true })
+    } catch (error) {
+        // Dua tab bisa mengirim ID yang sama bersamaan; duplikat bukan kegagalan.
+        if (error?.code !== 11000) throw error
+    }
     response.status(201).json({ ok: true })
 })
 
@@ -356,16 +373,43 @@ apiRouter.get('/dashboard', async (_request, response) => {
     ])
     const fareOf = new Map(fareAgg.map((f) => [f._id, f.fares.sort().join(', ')]))
 
-    const views = await PageView.find({}).sort({ date: -1 }).limit(14).lean()
-    const last = views.slice(0, 7).reverse()
-    const prev = views.slice(7, 14)
-    const sum = (arr) => arr.reduce((a, v) => a + v.count, 0)
-    const series = last.length
-        ? last.map((v) => [new Date(`${v.date}T00:00:00`).toLocaleDateString('id-ID', { weekday: 'short' }), v.count])
-        : [['—', 0]]
-    const visitors = {
-        total: sum(last),
-        delta: prev.length && sum(prev) ? Math.round(((sum(last) - sum(prev)) / sum(prev)) * 100) : 0,
+    // Kunjungan dihitung per tanggal nyata selama 14 hari terakhir, bukan dari
+    // "14 dokumen terakhir" — supaya baris lama (termasuk sisa seed dummy) yang
+    // tanggalnya sudah lewat tidak lagi tampil sebagai data minggu ini.
+    const DAY_MS = 24 * 3600 * 1000
+    const dayKey = (t) => new Date(t).toISOString().slice(0, 10)
+    const now = Date.now()
+    const keys = Array.from({ length: 14 }, (_, i) => dayKey(now - (13 - i) * DAY_MS))
+    const views = await PageView.find({ date: { $gte: keys[0], $lte: keys[13] } }).lean()
+    const countOf = new Map(views.map((v) => [v.date, v.count]))
+    const lastKeys = keys.slice(7)
+    const prevKeys = keys.slice(0, 7)
+    const totalOf = (arr) => arr.reduce((sum, key) => sum + (countOf.get(key) || 0), 0)
+    // Pengunjung unik per tanggal (ID anonim dari cookie). Total 7 hari memakai
+    // himpunan gabungan ID, bukan penjumlahan unik harian — orang yang datang di
+    // beberapa hari tidak dihitung berkali-kali.
+    const visitorAgg = await PageVisitor.aggregate([
+        { $match: { date: { $gte: keys[0], $lte: keys[13] } } },
+        { $group: { _id: '$date', vids: { $addToSet: '$vid' } } },
+    ])
+    const uniqOf = new Map(visitorAgg.map((v) => [v._id, v.vids.length]))
+    const uniqSetOf = (arr) => new Set(arr.flatMap((key) => visitorAgg.find((v) => v._id === key)?.vids || []))
+
+    const series = lastKeys.map((key) => [
+        new Date(`${key}T00:00:00`).toLocaleDateString('id-ID', { weekday: 'short' }),
+        countOf.get(key) || 0,
+        uniqOf.get(key) || 0,
+    ])
+    const prevTotal = totalOf(prevKeys)
+    const visits = {
+        total: totalOf(lastKeys),
+        delta: prevTotal ? Math.round(((totalOf(lastKeys) - prevTotal) / prevTotal) * 100) : 0,
+    }
+    const uniqueNow = uniqSetOf(lastKeys).size
+    const uniquePrev = uniqSetOf(prevKeys).size
+    const unique = {
+        total: uniqueNow,
+        delta: uniquePrev ? Math.round(((uniqueNow - uniquePrev) / uniquePrev) * 100) : 0,
     }
 
     const logs = await ActivityLog.find({ targetCollection: 'routes' }).sort({ timestamp: -1 }).limit(4).lean()
@@ -382,7 +426,8 @@ apiRouter.get('/dashboard', async (_request, response) => {
     response.json({
         biskita: { total: biskita, baru: baruOf.get('biskita') || 0, tarif: fareOf.get('biskita') || '—' },
         angkot: { total: angkot, baru: baruOf.get('angkot') || 0, tarif: fareOf.get('angkot') || '—' },
-        visitors,
+        visits,
+        unique,
         series,
         history,
     })
