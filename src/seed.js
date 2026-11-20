@@ -145,8 +145,8 @@ async function seed() {
     }
     console.log(`${stopsInserted.length} halte & ${links.length} relasi route_stops dimasukkan (${transitIds.size} titik transit).`)
 
-    const adminUsername = process.env.SEED_ADMIN_USERNAME || 'admin'
-    const adminPassword = process.env.SEED_ADMIN_PASSWORD || 'admin123'
+    const adminUsername = process.env.SEED_ADMIN_USERNAME || 'transgiscihuy'
+    const adminPassword = process.env.SEED_ADMIN_PASSWORD || 'transgisniwok,sstt'
     if (!(await Admin.findOne({ username: adminUsername }))) {
         await Admin.create({
             username: adminUsername,
